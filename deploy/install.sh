@@ -21,6 +21,7 @@ INSTALL_DIR="/opt/sub2api"
 SERVICE_NAME="sub2api"
 SERVICE_USER="sub2api"
 CONFIG_DIR="/etc/sub2api"
+DISTRO="linux"
 
 # Server configuration (will be set by user)
 SERVER_HOST="0.0.0.0"
@@ -433,9 +434,30 @@ detect_platform() {
     case "$OS" in
         linux)
             OS="linux"
+            # Detect Linux distribution variant
+            if [ -f /etc/alpine-release ]; then
+                DISTRO="alpine"
+                print_info "Detected Alpine Linux"
+            elif [ -f /etc/os-release ]; then
+                # Check if it's explicitly Alpine or other distros
+                DISTRO=$(grep -i "^ID=" /etc/os-release | cut -d'=' -f2 | tr -d '"' | tr '[:upper:]' '[:lower:]')
+                if [ "$DISTRO" != "alpine" ]; then
+                    # Check for common distros
+                    if grep -q "ubuntu\|debian" /etc/os-release; then
+                        DISTRO="debian"
+                    elif grep -q "centos\|rhel\|fedora" /etc/os-release; then
+                        DISTRO="rhel"
+                    else
+                        DISTRO="linux"
+                    fi
+                fi
+            else
+                DISTRO="linux"
+            fi
             ;;
         darwin)
             OS="darwin"
+            DISTRO="darwin"
             ;;
         *)
             print_error "$(msg 'unsupported_os'): $OS"
@@ -443,7 +465,7 @@ detect_platform() {
             ;;
     esac
 
-    print_info "$(msg 'detected_platform'): ${OS}_${ARCH}"
+    print_info "$(msg 'detected_platform'): ${OS}_${ARCH} (${DISTRO})"
 }
 
 # Check dependencies
@@ -461,6 +483,15 @@ check_dependencies() {
     if [ ${#missing[@]} -gt 0 ]; then
         print_error "$(msg 'missing_deps'): ${missing[*]}"
         print_info "$(msg 'install_deps_first')"
+        
+        # Provide installation hints based on distribution
+        if [ "$DISTRO" = "alpine" ]; then
+            echo "Alpine Linux - Install with: sudo apk add ${missing[*]}"
+        elif [ "$DISTRO" = "debian" ] || [ "$DISTRO" = "ubuntu" ]; then
+            echo "Debian/Ubuntu - Install with: sudo apt-get install ${missing[*]}"
+        elif [ "$DISTRO" = "rhel" ] || [ "$DISTRO" = "centos" ]; then
+            echo "RHEL/CentOS/Fedora - Install with: sudo yum install ${missing[*]}"
+        fi
         exit 1
     fi
 }
@@ -626,7 +657,13 @@ create_user() {
         print_info "$(msg 'creating_user') $SERVICE_USER..."
         # Use /bin/sh instead of /bin/false to allow sudo execution
         # The user still cannot login interactively (no password set)
-        useradd -r -s /bin/sh -d "$INSTALL_DIR" "$SERVICE_USER"
+        # Alpine: ensure -D option exists for home directory creation
+        if [ "$DISTRO" = "alpine" ]; then
+            adduser -D -s /bin/sh -h "$INSTALL_DIR" "$SERVICE_USER" 2>/dev/null || \
+            useradd -r -s /bin/sh -d "$INSTALL_DIR" "$SERVICE_USER"
+        else
+            useradd -r -s /bin/sh -d "$INSTALL_DIR" "$SERVICE_USER"
+        fi
         print_success "$(msg 'user_created')"
     fi
 }
@@ -647,10 +684,24 @@ setup_directories() {
     print_success "$(msg 'dirs_configured')"
 }
 
-# Install systemd service
+# Install service (systemd or OpenRC)
 install_service() {
     print_info "$(msg 'installing_service')"
 
+    if [ "$DISTRO" = "alpine" ]; then
+        # Alpine Linux - Use OpenRC
+        install_openrc_service
+    elif command -v systemctl &> /dev/null; then
+        # systemd available
+        install_systemd_service
+    else
+        print_error "Neither systemd nor OpenRC found"
+        return 1
+    fi
+}
+
+# Install systemd service
+install_systemd_service() {
     # Create service file with configured host and port
     cat > /etc/systemd/system/sub2api.service << EOF
 [Unit]
@@ -693,6 +744,55 @@ EOF
     print_success "$(msg 'service_installed')"
 }
 
+# Install OpenRC service (for Alpine Linux)
+install_openrc_service() {
+    cat > /etc/init.d/sub2api << 'EOFRC'
+#!/sbin/openrc-run
+
+description="Sub2API - AI API Gateway Platform"
+command="/opt/sub2api/sub2api"
+command_user="sub2api"
+pidfile="/var/run/sub2api.pid"
+start_stop_daemon_args="-b -m --pidfile $pidfile"
+
+: ${SERVER_HOST:=0.0.0.0}
+: ${SERVER_PORT:=8080}
+
+export SERVER_HOST
+export SERVER_PORT
+export GIN_MODE=release
+
+depend() {
+    after network
+    use postgresql redis
+}
+
+start() {
+    ebegin "Starting Sub2API"
+    start-stop-daemon --start \
+        --exec $command \
+        --pidfile $pidfile \
+        --user $command_user \
+        $start_stop_daemon_args
+    eend $?
+}
+
+stop() {
+    ebegin "Stopping Sub2API"
+    start-stop-daemon --stop --pidfile $pidfile
+    eend $?
+}
+
+restart() {
+    stop
+    start
+}
+EOFRC
+
+    chmod +x /etc/init.d/sub2api
+    print_success "$(msg 'service_installed')"
+}
+
 # Prepare for setup wizard (no config file needed - setup wizard will create it)
 prepare_for_setup() {
     print_success "$(msg 'ready_for_setup')"
@@ -725,13 +825,26 @@ get_public_ip() {
 start_service() {
     print_info "$(msg 'starting_service')"
 
-    if systemctl start sub2api; then
-        print_success "$(msg 'service_started')"
-        return 0
+    if [ "$DISTRO" = "alpine" ]; then
+        # Alpine Linux - Use OpenRC
+        if rc-service sub2api start; then
+            print_success "$(msg 'service_started')"
+            return 0
+        else
+            print_error "$(msg 'service_start_failed')"
+            print_info "sudo rc-service sub2api status"
+            return 1
+        fi
     else
-        print_error "$(msg 'service_start_failed')"
-        print_info "sudo journalctl -u sub2api -n 50"
-        return 1
+        # systemd
+        if systemctl start sub2api; then
+            print_success "$(msg 'service_started')"
+            return 0
+        else
+            print_error "$(msg 'service_start_failed')"
+            print_info "sudo journalctl -u sub2api -n 50"
+            return 1
+        fi
     fi
 }
 
@@ -739,12 +852,24 @@ start_service() {
 enable_autostart() {
     print_info "$(msg 'enabling_autostart')"
 
-    if systemctl enable sub2api 2>/dev/null; then
-        print_success "$(msg 'autostart_enabled')"
-        return 0
+    if [ "$DISTRO" = "alpine" ]; then
+        # Alpine Linux - Use OpenRC
+        if rc-update add sub2api 2>/dev/null; then
+            print_success "$(msg 'autostart_enabled')"
+            return 0
+        else
+            print_warning "Failed to enable auto-start"
+            return 1
+        fi
     else
-        print_warning "Failed to enable auto-start"
-        return 1
+        # systemd
+        if systemctl enable sub2api 2>/dev/null; then
+            print_success "$(msg 'autostart_enabled')"
+            return 0
+        else
+            print_warning "Failed to enable auto-start"
+            return 1
+        fi
     fi
 }
 
@@ -780,10 +905,21 @@ print_completion() {
     echo "  $(msg 'useful_commands')"
     echo "=============================================="
     echo ""
-    echo "  $(msg 'cmd_status'):   sudo systemctl status sub2api"
-    echo "  $(msg 'cmd_logs'):     sudo journalctl -u sub2api -f"
-    echo "  $(msg 'cmd_restart'):  sudo systemctl restart sub2api"
-    echo "  $(msg 'cmd_stop'):     sudo systemctl stop sub2api"
+    
+    if [ "$DISTRO" = "alpine" ]; then
+        # OpenRC commands for Alpine
+        echo "  $(msg 'cmd_status'):   sudo rc-service sub2api status"
+        echo "  $(msg 'cmd_logs'):     sudo tail -f /var/log/messages | grep sub2api"
+        echo "  $(msg 'cmd_restart'):  sudo rc-service sub2api restart"
+        echo "  $(msg 'cmd_stop'):     sudo rc-service sub2api stop"
+    else
+        # systemd commands for other distros
+        echo "  $(msg 'cmd_status'):   sudo systemctl status sub2api"
+        echo "  $(msg 'cmd_logs'):     sudo journalctl -u sub2api -f"
+        echo "  $(msg 'cmd_restart'):  sudo systemctl restart sub2api"
+        echo "  $(msg 'cmd_stop'):     sudo systemctl stop sub2api"
+    fi
+    
     echo ""
     echo "=============================================="
 }
@@ -804,9 +940,16 @@ upgrade() {
     print_info "$(msg 'current_version'): $CURRENT_VERSION"
 
     # Stop service
-    if systemctl is-active --quiet sub2api; then
-        print_info "$(msg 'stopping_service')"
-        systemctl stop sub2api
+    if [ "$DISTRO" = "alpine" ]; then
+        if rc-service sub2api status > /dev/null 2>&1; then
+            print_info "$(msg 'stopping_service')"
+            rc-service sub2api stop
+        fi
+    else
+        if systemctl is-active --quiet sub2api; then
+            print_info "$(msg 'stopping_service')"
+            systemctl stop sub2api
+        fi
     fi
 
     # Backup current binary
@@ -822,7 +965,11 @@ upgrade() {
 
     # Start service
     print_info "$(msg 'starting_service')"
-    systemctl start sub2api
+    if [ "$DISTRO" = "alpine" ]; then
+        rc-service sub2api start
+    else
+        systemctl start sub2api
+    fi
 
     print_success "$(msg 'upgrade_complete')"
 }
@@ -856,9 +1003,16 @@ install_version() {
     fi
 
     # Stop service if running
-    if systemctl is-active --quiet sub2api; then
-        print_info "$(msg 'stopping_service')"
-        systemctl stop sub2api
+    if [ "$DISTRO" = "alpine" ]; then
+        if rc-service sub2api status > /dev/null 2>&1; then
+            print_info "$(msg 'stopping_service')"
+            rc-service sub2api stop
+        fi
+    else
+        if systemctl is-active --quiet sub2api; then
+            print_info "$(msg 'stopping_service')"
+            systemctl stop sub2api
+        fi
     fi
 
     # Backup current binary (for potential recovery)
@@ -884,11 +1038,20 @@ install_version() {
 
     # Start service
     print_info "$(msg 'starting_service')"
-    if systemctl start sub2api; then
-        print_success "$(msg 'service_started')"
+    if [ "$DISTRO" = "alpine" ]; then
+        if rc-service sub2api start; then
+            print_success "$(msg 'service_started')"
+        else
+            print_error "$(msg 'service_start_failed')"
+            print_info "sudo rc-service sub2api status"
+        fi
     else
-        print_error "$(msg 'service_start_failed')"
-        print_info "sudo journalctl -u sub2api -n 50"
+        if systemctl start sub2api; then
+            print_success "$(msg 'service_started')"
+        else
+            print_error "$(msg 'service_start_failed')"
+            print_info "sudo journalctl -u sub2api -n 50"
+        fi
     fi
 
     # Print completion message
@@ -923,12 +1086,21 @@ uninstall() {
     fi
 
     print_info "$(msg 'stopping_service')"
-    systemctl stop sub2api 2>/dev/null || true
-    systemctl disable sub2api 2>/dev/null || true
+    if [ "$DISTRO" = "alpine" ]; then
+        rc-service sub2api stop 2>/dev/null || true
+        rc-update del sub2api 2>/dev/null || true
+    else
+        systemctl stop sub2api 2>/dev/null || true
+        systemctl disable sub2api 2>/dev/null || true
+    fi
 
     print_info "$(msg 'removing_files')"
-    rm -f /etc/systemd/system/sub2api.service
-    systemctl daemon-reload
+    if [ "$DISTRO" = "alpine" ]; then
+        rm -f /etc/init.d/sub2api
+    else
+        rm -f /etc/systemd/system/sub2api.service
+        systemctl daemon-reload
+    fi
 
     print_info "$(msg 'removing_install_dir')"
     rm -rf "$INSTALL_DIR"

@@ -633,6 +633,13 @@ download_and_extract() {
         cp -r "$TEMP_DIR/deploy/"* "$INSTALL_DIR/" 2>/dev/null || true
     fi
 
+    # Set correct permissions immediately after extraction
+    # This ensures config files are writable by the service user
+    chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR" 2>/dev/null || true
+    find "$INSTALL_DIR" -type f -exec chmod 644 {} \; 2>/dev/null || true
+    find "$INSTALL_DIR" -type d -exec chmod 755 {} \; 2>/dev/null || true
+    chmod +x "$INSTALL_DIR/sub2api"
+
     print_success "$(msg 'binary_installed') $INSTALL_DIR/sub2api"
 }
 
@@ -677,9 +684,17 @@ setup_directories() {
     mkdir -p "$INSTALL_DIR/data"
     mkdir -p "$CONFIG_DIR"
 
-    # Set ownership
+    # Set ownership and permissions recursively
     chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
     chown -R "$SERVICE_USER:$SERVICE_USER" "$CONFIG_DIR"
+    
+    # Ensure correct file permissions
+    find "$INSTALL_DIR" -type f -exec chmod 644 {} \; 2>/dev/null || true
+    find "$INSTALL_DIR" -type d -exec chmod 755 {} \; 2>/dev/null || true
+    chmod +x "$INSTALL_DIR/sub2api"
+    
+    # Ensure data directory is writable
+    chmod 755 "$INSTALL_DIR/data"
 
     print_success "$(msg 'dirs_configured')"
 }
@@ -731,6 +746,7 @@ ReadWritePaths=/opt/sub2api
 
 # Environment - Server configuration
 Environment=GIN_MODE=release
+Environment=DATA_DIR=/opt/sub2api
 Environment=SERVER_HOST=${SERVER_HOST}
 Environment=SERVER_PORT=${SERVER_PORT}
 
@@ -752,45 +768,42 @@ install_openrc_service() {
 description="Sub2API - AI API Gateway Platform"
 command="/opt/sub2api/sub2api"
 command_user="sub2api"
-pidfile="/var/run/sub2api.pid"
-start_stop_daemon_args="-b -m --pidfile $pidfile"
+command_background="yes"
+directory="/opt/sub2api"
+pidfile="/run/sub2api.pid"
+output_logger="logger -t sub2api -p daemon.info"
+error_logger="logger -t sub2api -p daemon.err"
 
+: ${DATA_DIR:=/opt/sub2api}
 : ${SERVER_HOST:=0.0.0.0}
 : ${SERVER_PORT:=8080}
 
+export DATA_DIR
 export SERVER_HOST
 export SERVER_PORT
 export GIN_MODE=release
 
 depend() {
     after network
+    need syslog
     use postgresql redis
 }
 
-start() {
-    ebegin "Starting Sub2API"
-    start-stop-daemon --start \
-        --exec $command \
-        --pidfile $pidfile \
-        --user $command_user \
-        $start_stop_daemon_args
-    eend $?
-}
-
-stop() {
-    ebegin "Stopping Sub2API"
-    start-stop-daemon --stop --pidfile $pidfile
-    eend $?
-}
-
-restart() {
-    stop
-    start
+start_pre() {
+    checkpath --directory --mode 0755 /run
 }
 EOFRC
 
     chmod +x /etc/init.d/sub2api
     print_success "$(msg 'service_installed')"
+}
+
+# Ensure Alpine syslog is available for OpenRC logger output
+ensure_alpine_syslog() {
+    if [ "$DISTRO" = "alpine" ]; then
+        rc-update add syslog boot 2>/dev/null || true
+        rc-service syslog start 2>/dev/null || true
+    fi
 }
 
 # Prepare for setup wizard (no config file needed - setup wizard will create it)
@@ -827,6 +840,7 @@ start_service() {
 
     if [ "$DISTRO" = "alpine" ]; then
         # Alpine Linux - Use OpenRC
+        ensure_alpine_syslog
         if rc-service sub2api start; then
             print_success "$(msg 'service_started')"
             return 0
@@ -854,6 +868,7 @@ enable_autostart() {
 
     if [ "$DISTRO" = "alpine" ]; then
         # Alpine Linux - Use OpenRC
+        ensure_alpine_syslog
         if rc-update add sub2api 2>/dev/null; then
             print_success "$(msg 'autostart_enabled')"
             return 0
@@ -909,7 +924,7 @@ print_completion() {
     if [ "$DISTRO" = "alpine" ]; then
         # OpenRC commands for Alpine
         echo "  $(msg 'cmd_status'):   sudo rc-service sub2api status"
-        echo "  $(msg 'cmd_logs'):     sudo tail -f /var/log/messages | grep sub2api"
+        echo "  $(msg 'cmd_logs'):     sudo logread -f | grep sub2api"
         echo "  $(msg 'cmd_restart'):  sudo rc-service sub2api restart"
         echo "  $(msg 'cmd_stop'):     sudo rc-service sub2api stop"
     else
@@ -966,6 +981,7 @@ upgrade() {
     # Start service
     print_info "$(msg 'starting_service')"
     if [ "$DISTRO" = "alpine" ]; then
+        ensure_alpine_syslog
         rc-service sub2api start
     else
         systemctl start sub2api
@@ -1039,6 +1055,7 @@ install_version() {
     # Start service
     print_info "$(msg 'starting_service')"
     if [ "$DISTRO" = "alpine" ]; then
+        ensure_alpine_syslog
         if rc-service sub2api start; then
             print_success "$(msg 'service_started')"
         else

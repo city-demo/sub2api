@@ -122,19 +122,46 @@ sudo rc-update del sub2api
 sudo rc-config list
 ```
 
+本地安装时，OpenRC 服务会强制设置 `DATA_DIR=/opt/sub2api`，避免误读 Docker 默认路径 `/app/data`。
+
+如果系统没有启用 syslog，请先启动它，Sub2API 的 Alpine 服务现在通过 syslog 记录输出：
+
+```bash
+sudo rc-update add syslog boot
+sudo rc-service syslog start
+```
+
+#### 服务启动卡住？
+
+如果 `rc-service sub2api restart` 启动卡住，请参考 [TROUBLESHOOT.md](TROUBLESHOOT.md) 的故障排查指南。
+
+**快速修复**（如果遇到启动卡住）：
+```bash
+# 1. 停止并清理
+sudo rc-service sub2api stop
+sudo killall sub2api 2>/dev/null || true
+sudo rm -f /var/run/sub2api.pid
+
+# 2. 重新生成服务脚本
+curl -sSL https://raw.githubusercontent.com/Wei-Shaw/sub2api/main/deploy/install.sh | sudo bash -s -- install
+
+# 3. 启动
+sudo rc-service sub2api start
+```
+
 ### 查看日志
 
 Alpine 的 OpenRC 日志输出到系统日志（syslog）：
 
 ```bash
 # 查看最新日志
-sudo tail -f /var/log/messages
-
-# 或使用 logread（如果配置了）
 sudo logread -f
 
+# 如果系统写入 /var/log/messages，也可以这样看
+sudo tail -f /var/log/messages
+
 # 查找 Sub2API 相关日志
-sudo grep sub2api /var/log/messages
+sudo logread -f | grep sub2api
 ```
 
 ## 常见问题
@@ -180,6 +207,45 @@ sudo apk add postgresql-client
 psql -h localhost -U postgres -c "SELECT 1"
 ```
 
+### 问题 4：配置文件权限错误 (permission denied)
+
+如果遇到 `open ./config.yaml: permission denied` 错误，原因通常是：
+
+1. **文件所有权错误** - 文件由 root 拥有，但应该由 sub2api 拥有
+2. **工作目录错误** - 应用程序在错误的目录中启动
+
+**完整修复方案**：
+```bash
+# 1. 修复文件权限和所有权
+sudo chown -R sub2api:sub2api /opt/sub2api
+sudo find /opt/sub2api -type f -exec chmod 644 {} \;
+sudo find /opt/sub2api -type d -exec chmod 755 {} \;
+sudo chmod +x /opt/sub2api/sub2api
+sudo chmod 755 /opt/sub2api/data
+
+# 2. 重新生成 OpenRC 脚本（包含正确的工作目录）
+curl -sSL https://raw.githubusercontent.com/Wei-Shaw/sub2api/main/deploy/install.sh | sudo bash -s -- install -v $(curl -s https://api.github.com/repos/Wei-Shaw/sub2api/releases/latest | grep -o '"tag_name": "[^"]*' | cut -d'"' -f4)
+
+# 3. 重启服务
+sudo rc-service sub2api restart
+
+# 4. 验证工作目录
+sudo rc-service sub2api status
+ps aux | grep sub2api
+```
+
+如果仍然有权限问题，检查：
+```bash
+# 查看配置文件的所有者和权限
+ls -la /opt/sub2api/config.yaml
+
+# 查看应用进程的用户
+ps aux | grep sub2api
+
+# 查看进程的工作目录
+pwdx $(pgrep sub2api)
+```
+
 ## 性能优化
 
 ### 内存优化
@@ -219,8 +285,8 @@ sudo iptables -A INPUT -p tcp --dport 8080 -j ACCEPT
 
 ```bash
 # 限制配置文件权限
-sudo chmod 600 /etc/sub2api/config.yaml
-sudo chown sub2api:sub2api /etc/sub2api/config.yaml
+sudo chmod 600 /opt/sub2api/config.yaml
+sudo chown sub2api:sub2api /opt/sub2api/config.yaml
 ```
 
 ## 日志管理
@@ -229,13 +295,10 @@ Alpine 使用 OpenRC 的日志输出到系统日志：
 
 ```bash
 # 查看最新日志（实时）
-sudo tail -f /var/log/messages
-
-# 查看 Sub2API 相关日志
-sudo grep sub2api /var/log/messages
-
-# 使用 logread 查看日志
 sudo logread -f
+
+# 如果系统写入 /var/log/messages，也可以查看该文件
+sudo tail -f /var/log/messages
 
 # 导出日志到文件
 sudo logread > sub2api.log
@@ -243,7 +306,7 @@ sudo logread > sub2api.log
 
 ### 配置日志级别
 
-编辑 `/etc/sub2api/config.yaml` 来调整日志级别：
+编辑 `/opt/sub2api/config.yaml` 来调整日志级别：
 
 ```yaml
 log:
@@ -294,6 +357,7 @@ curl -sSL https://raw.githubusercontent.com/Wei-Shaw/sub2api/main/deploy/install
 如遇问题，请：
 
 1. 查看日志：`sudo tail -f /var/log/messages | grep sub2api` 或 `sudo logread -f`
+1. 确认 syslog 已运行：`sudo rc-service syslog status`
 2. 检查服务状态：`sudo rc-service sub2api status`
 3. 检查系统要求：`uname -a`
 4. 验证依赖：`which curl tar ca-certificates`
